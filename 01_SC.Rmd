@@ -1,0 +1,193 @@
+---
+title: "02_Single_Cell_QC"
+author: "jibsch"
+date: "2022-11-10"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+```{r}
+library(Seurat)
+library(tidyverse)
+source("~/tools/BioinfTools/Plotting_Functions.R")
+```
+
+```{r}
+
+samples = lapply(list("Clone13_d21", "Mix_d21", "Arm_d21", "Arm_d8"),
+                 function(x) Read10X(paste("../../data/laneA_multi/outs/per_sample_outs/",
+                                           x,"/count/sample_feature_bc_matrix/",sep="")))
+
+s1 = CreateSeuratObject(samples[[1]]$`Gene Expression`, project = "Clone13_d21")
+s1$lane = "lane A"
+s2 = CreateSeuratObject(samples[[2]]$`Gene Expression`, project = "Mix_d21")
+s2$lane = "lane A"
+s3 = CreateSeuratObject(samples[[3]]$`Gene Expression`, project = "Arm_d21")
+s3$lane = "lane A"
+s4 = CreateSeuratObject(samples[[4]]$`Gene Expression`, project = "Arm_d8")
+s4$lane = "lane A"
+
+samples = lapply(list("Clone13_d21", "Mix_d21", "Arm_d21"),
+                 function(x) Read10X(paste("../../data/laneB_multi/outs/per_sample_outs/",
+                                           x,"/count/sample_feature_bc_matrix/",sep="")))
+
+s5 = CreateSeuratObject(samples[[1]]$`Gene Expression`, project = "Clone13_d21")
+s5$lane = "lane B"
+s6 = CreateSeuratObject(samples[[2]]$`Gene Expression`, project = "Mix_d21")
+s6$lane = "lane B"
+s7 = CreateSeuratObject(samples[[3]]$`Gene Expression`, project = "Arm_d21")
+s7$lane = "lane B"
+
+seu = reduce(list(s1, s2, s3, s4, s5, s6, s7), merge)
+
+seu$percent.mt = PercentageFeatureSet(seu, pattern = "^mt")
+
+VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), split.by = "lane")
+```
+```{r}
+seu_filtered = seu[,seu$nFeature_RNA > 800 & seu$percent.mt < 7]
+
+seu_filtered = SCTransform(seu_filtered)
+
+varfeatures = seu_filtered@assays$SCT@var.features
+varfeatures = varfeatures[!grepl("^Tr[ab]", varfeatures)]
+
+seu_filtered = RunPCA(seu_filtered, features = varfeatures, verbose = F)
+
+seu_filtered = RunUMAP(seu_filtered, dims = 1:25)
+seu_filtered = FindNeighbors(seu_filtered, dims = 1:25)
+
+seu_filtered = FindClusters(seu_filtered)
+
+DimPlot(seu_filtered, group.by = c("orig.ident", "lane", "seurat_clusters"), label = T)
+```
+```{r}
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+library(org.Mm.eg.db)
+mm.pairs.symbol = lapply(mm.pairs, function(x) {
+  data.frame(first = mapIds(org.Mm.eg.db, x$first, "ENSEMBL", column = "SYMBOL"),
+            second = mapIds(org.Mm.eg.db, x$second, "ENSEMBL", column = "SYMBOL"))})
+
+assigned <- scran::cyclone(Seurat::as.SingleCellExperiment(seu_filtered), pairs=mm.pairs.symbol)
+
+seu_filtered$Phase = assigned$phases
+DimPlot(seu_filtered, group.by = "Phase")
+```
+```{r}
+seu_filtered2 = seu_filtered[,seu_filtered$seurat_clusters != 13]
+```
+
+```{r}
+seu_filtered2 = SCTransform(seu_filtered2)
+
+varfeatures = seu_filtered2@assays$SCT@var.features
+varfeatures = varfeatures[!grepl("^Tr[ab]", varfeatures)]
+
+seu_filtered2 = RunPCA(seu_filtered2, features = varfeatures, verbose = F)
+
+seu_filtered2 = RunUMAP(seu_filtered2, dims = 1:25)
+seu_filtered2 = FindNeighbors(seu_filtered2, dims = 1:25)
+
+seu_filtered2 = FindClusters(seu_filtered2)
+
+DimPlot(seu_filtered2, group.by = c("orig.ident", "lane", "seurat_clusters", "Phase"), label = T)
+```
+## Cluster Markers
+```{r}
+markers = FindAllMarkers(seu_filtered2, only.pos = F)
+write.csv(markers, file = "../output/markers_seu_filtered2.csv", row.names = F, quote = F)
+```
+
+```{r}
+markers_right = FindAllMarkers(seu_filtered2[,seu_filtered2$seurat_clusters %in% c(2,6,11,15)], only.pos = F)
+write.csv(markers_right, file = "../output/markers_right.csv", row.names = F, quote = F)
+
+markers_left = FindAllMarkers(seu_filtered2[,seu_filtered2$seurat_clusters %in% c(4,8,9,0,10,12)], only.pos = F)
+write.csv(markers_left, file = "../output/markers_left.csv", row.names = F, quote = F)
+```
+
+
+```{r}
+markers_d8 = FindMarkers(seu_filtered2, ident.1 = "12", ident.2 = "17")
+write.csv(markers_d8, file = "../output/markers_d8_12_vs_17.csv", row.names = T, quote = F)
+```
+
+## Sub-cluster D8
+```{r}
+tmp = FindClusters(seu_filtered2, resolution = 2)
+DimPlot(tmp, label = T)
+
+
+
+seu_filtered2$seurat_clusters = as.numeric(ifelse(tmp$SCT_snn_res.2 == 20, 17, as.character(seu_filtered2$SCT_snn_res.0.8)))
+seu_filtered2@active.ident = factor(seu_filtered2$seurat_clusters)
+```
+
+
+
+```{r}
+library(edgeR)
+library(org.Mm.eg.db)
+library(openxlsx)
+
+keggs = list()
+wb = createWorkbook()
+markers$entrez = mapIds(org.Mm.eg.db, markers$gene, "SYMBOL", column = "ENTREZID")
+for(i in 0:16){
+  n = paste("KEGG cluster",i)
+  # keggs[[n]] = topKEGG(kegga(de = markers$entrez[markers$avg_log2FC > 0 & markers$cluster == i],
+  #                             species = "Mm"), number = 20)
+  addWorksheet(wb, n)
+  writeData(wb, n, keggs[[n]])
+  
+}
+
+saveWorkbook(wb, file = "../output/markers_seu_filtered2_kegg.xlsx", overwrite = T)
+```
+
+
+## Shiny App
+```{r}
+library(ShinyCell)
+
+scConf = createConfig(seu_filtered2)
+
+makeShinyApp(seu_filtered2, scConf, gene.mapping = TRUE, gex.assay = "SCT",
+             shiny.title = "Mouse Infected T Cells", shiny.dir = "Utzschneider_SC") 
+```
+## Regress CC
+```{r}
+seu_filtered2$S_score = assigned$scores$S[seu_filtered$seurat_clusters != 13]
+seu_filtered2$G2M_score = assigned$scores$G2M[seu_filtered$seurat_clusters != 13]
+seu_filtered2_cc = SCTransform(seu_filtered2, vars.to.regress = c("S_score", "G2M_score"))
+```
+
+```{r}
+varfeatures = seu_filtered2_cc@assays$SCT@var.features
+varfeatures = varfeatures[!grepl("^Tr[ab]", varfeatures)]
+
+seu_filtered2_cc = RunPCA(seu_filtered2_cc, features = varfeatures, verbose = F)
+
+seu_filtered2_cc = RunUMAP(seu_filtered2_cc, dims = 1:25)
+seu_filtered2_cc = FindNeighbors(seu_filtered2_cc, dims = 1:25)
+
+seu_filtered2_cc = FindClusters(seu_filtered2_cc)
+
+DimPlot(seu_filtered2_cc, group.by = c("orig.ident", "lane", "seurat_clusters", "Phase"), label = T)
+```
+Looks the same.
+
+## CytoTRACE
+```{r}
+library(CytoTRACE)
+
+cytotrace = CytoTRACE(as.matrix(seu_filtered2@assays$SCT@data))
+
+seu_filtered2$CytoTRACE = cytotrace$CytoTRACE
+
+plotto_signature_scoring_plot("CytoTRACE", seu_filtered2, size = 1)
+```
+

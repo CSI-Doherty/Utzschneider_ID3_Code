@@ -1,0 +1,379 @@
+---
+title: "01_Analysis"
+author: "jibsch"
+date: "2024-08-28"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+## Introduction
+
+```{r}
+library(tidyverse)
+library(edgeR)
+library(ggrepel)
+dge = readRDS("../output/dge.Rds")
+```
+```{r}
+data = read.table("../data/table_id3_bulk", sep = "\t", header = T)
+
+names(data) = gsub("..align.AGRF_CAGRF24080064_22N3C3LT3..", "", names(data)) %>%
+  gsub("_22N3C3LT3_[ACGT]*_L008.PE.starAligned.sortedByCoord.out.bam", "", .) %>%
+  gsub("[.]","",.)
+
+row.names(data) = data$Geneid
+
+meta = read.table("../data/meta.txt")
+
+dge = DGEList(data[,-c(1:6)])
+dge$samples$sort = meta$V5
+dge$samples$genotype = meta$V4
+
+dge$samples$group = paste(dge$samples$sort, dge$samples$genotype, sep = "_") %>%
+  gsub("[+]", "",.) %>% gsub("-","_",.)
+
+dge = dge[filterByExpr(dge),]
+dge = dge[!grepl("Tr", row.names(dge)) & !grepl("Ig", row.names(dge)),]
+dge = dge[!grepl("H2", row.names(dge)) & !row.names(dge) == "Jchain",]
+dge = dge[row.names(dge) %in% filt$g,]
+dge = calcNormFactors(dge)
+
+plotMDS(dge, col = as.numeric(factor(dge$samples$genotype)))
+```
+```{r}
+library(ggrepel)
+pca = prcomp(t(cpm(dge, log = T)))
+
+dge$samples %>% as_tibble(rownames = "sample") %>%
+  mutate(x = pca$x[,1], y = pca$x[,2]) %>%
+  pivot_longer(cols = c(sort, genotype)) %>%
+  ggplot(aes(x,y)) +
+  geom_point(aes(colour = value)) +
+  geom_text_repel(aes(label = sample)) +
+  facet_wrap(~name) + theme_classic()
+```
+
+
+```{r}
+G = dge$samples$group
+design = model.matrix(~0+G)
+v = voom(dge, design, plot = T)
+
+fit = lmFit(v, design)
+
+fit = contrasts.fit(fit, makeContrasts("Sell_pos_KO_vs_Wt" = GCD62L_ID3_KO -  GCD62L_WT,
+                                        "DN_KO_vs_WT" = GDNs_ID3_KO - GCD62L_WT,
+                                        levels = design))
+
+efit = eBayes(fit)
+summary(decideTests(efit))
+```
+```{r}
+G = dge$samples$genotype
+S = dge$samples$sort
+design2 = model.matrix(~G+S)
+v = voom(dge, design2, plot = T)
+
+fit2 = lmFit(v, design2)
+
+fit2 = contrasts.fit(fit2, coefficients = 2)
+
+efit2 = eBayes(fit2)
+summary(decideTests(efit2))
+
+topTable(efit2)
+```
+## Test Replciates
+```{r}
+S = row.names(dge$samples)
+design3 = model.matrix(~0+S)
+
+dge2 = dge
+dge$samples$group = paste("S", S)
+
+t1 = exactTest(dge, pair = c(5,1), dispersion = 0.5)
+topTags(t1)
+
+t2 = exactTest(dge, pair = c(6,2), dispersion = 0.5)
+topTags(t2)
+
+t3 = exactTest(dge, pair = c(3,1), dispersion = 0.5)
+topTags(t3)
+
+t4 = exactTest(dge, pair = c(4,2), dispersion = 0.5)
+topTags(t4)
+```
+## RUV
+```{r}
+library(ruv)
+
+Y = RUVIII(t(cpm(dge, log = T)), M = model.matrix(~0+dge$samples$group), ctl = rep(T, length(row.names(dge))), k=3)
+
+pca2 = prcomp(Y)
+
+dge$samples %>% as_tibble(rownames = "sample") %>%
+  mutate(x = pca2$x[,1], y = pca2$x[,2]) %>% 
+  pivot_longer(cols = c(sort, genotype, group)) %>%
+  ggplot(aes(x,y)) +
+  geom_point(aes(colour = value)) +
+  geom_text_repel(aes(label = sample)) +
+  facet_wrap(~name) + theme_classic()
+```
+
+```{r}
+W = RUV4(Y = t(cpm(dge,log=T)), X = dge$samples$group, ctl = rep(T, length(row.names(dge))), k=3)
+G=dge$samples$group
+design3 = model.matrix(~0+G+W$W)
+colnames(design3)[5:7] = paste0("W",1:3)
+
+v= voom(dge, design3)
+fit = lmFit(v, design3)
+
+fit = contrasts.fit(fit, makeContrasts("Sell_pos_KO_vs_Wt" = GCD62L_ID3_KO -  GCD62L_WT,
+                                        "DN_KO_vs_WT" = GDNs_ID3_KO - GDNs_WT,
+                                       "WT_Sell_vs_DN" = GCD62L_WT - GDNs_WT,
+                                        levels = design3))
+
+efit_ruv = eBayes(fit)
+summary(decideTests(efit_ruv))
+
+topTable(efit_ruv)
+```
+## Volcano
+```{r}
+colours = RColorBrewer::brewer.pal(11, "Spectral")[c(1,4,10)]
+names(colours) = c("Kit_positive" , "Double_negative", "CD62L_positive")
+cols = list("Sell_pos_KO_vs_Wt" = unname(c(colours["CD62L_positive"], "grey", colours["Kit_positive"])),
+            "DN_KO_vs_WT" = unname(c(colours["CD62L_positive"], "grey", colours["Kit_positive"])))
+
+ps = list()
+# genes = c("Sell", "Dapl1", "Il7r", "Ccl5", "Ccr7", "Il6ra", "S1pr1", "Nr4a2", "Tox2", 
+#            "Il2ra", "Kit", "Xcl1", "Id3", "Tcf7", "Bach")
+dotsize_outer = 2
+dotsize_inner = 1
+
+limits = topTable(efit_ruv, number = Inf) %>% as_tibble() %>% dplyr::select(-F, -adj.P.Val, -AveExpr)  %>%
+  pivot_longer(cols = 1:2) %>% 
+  summarise(xmin = min(value), xmax = max(value),ymin = 0, ymax=max(-log10(P.Value+1E-127)))
+
+for(c in c("Sell_pos_KO_vs_Wt", "DN_KO_vs_WT")) {
+  comp = topTable(efit_ruv, coef = c, number = Inf) %>%
+    as_tibble(rownames = "gene") %>% mutate(sig = adj.P.Val <= 0.05 , up = logFC >0) %>%
+    mutate(g = ifelse(sig, ifelse(up, "Up", "Down"), "Not Sig")) %>%
+    mutate(P.Value = ifelse(P.Value < 1E-127, 1E-127, P.Value))
+
+  ggplot(comp, aes(logFC, -log10(P.Value))) +
+    geom_point(aes(colour = g), size = dotsize_inner) +
+    geom_point(data = comp %>% slice_head(n=15), colour = "green", size = dotsize_outer) +
+    geom_point(data = comp %>% slice_head(n=15), aes(colour = g), size = dotsize_inner) +
+    theme_classic() +
+    scale_colour_manual(values = cols[[c]]) +
+    geom_text_repel(data = comp %>% slice_head(n=15), aes(label = gene), show.legend = F, box.padding = 0.9, max.overlaps = Inf) +
+    # {if(c != "DN_vs_Kit" )theme(legend.position = "none")} +
+    theme(legend.position = "none") +
+    labs(colour = "P.val") +
+    scale_x_continuous(limits = c(limits$xmin, limits$xmax)) +
+    scale_y_continuous(limits = c(limits$ymin, limits$ymax)) +
+    ggtitle(c) -> p
+  ps[[c]] = p
+  
+  ggsave(p, filename = paste0("../plots/volcanos_",c,".pdf"), width = 10, height = 10, units = "cm")
+}
+
+
+```
+
+## MA Plot
+```{r}
+colours = RColorBrewer::brewer.pal(11, "Spectral")[c(1,4,10)]
+names(colours) = c("Kit_positive" , "Double_negative", "CD62L_positive")
+cols = list("Sell_pos_KO_vs_Wt" = unname(c(colours["CD62L_positive"], "grey", colours["Kit_positive"])),
+            "DN_KO_vs_WT" = unname(c(colours["CD62L_positive"], "grey", colours["Kit_positive"])))
+
+ps = list()
+# genes = c("Sell", "Dapl1", "Il7r", "Ccl5", "Ccr7", "Il6ra", "S1pr1", "Nr4a2", "Tox2", 
+#            "Il2ra", "Kit", "Xcl1", "Id3", "Tcf7", "Bach")
+dotsize_outer = 1
+dotsize_inner = 0.5
+
+
+for(c in c("Sell_pos_KO_vs_Wt", "DN_KO_vs_WT")) {
+  comp = topTable(efit_ruv, coef = c, number = Inf) %>%
+    as_tibble(rownames = "gene") %>% mutate(sig = adj.P.Val <= 0.05 , up = logFC >0) %>%
+    mutate(g = ifelse(sig, ifelse(up, "Up", "Down"), "Not Sig")) 
+
+  ggplot(comp, aes(AveExpr, logFC)) +
+    geom_point(aes(colour = g), size = dotsize_inner) +
+    geom_point(data = comp %>% slice_head(n=15), colour = "green", size = dotsize_outer) +
+    geom_point(data = comp %>% slice_head(n=15), aes(colour = g), size = dotsize_inner) +
+    theme_classic() +
+    scale_colour_manual(values = cols[[c]]) +
+    geom_text_repel(data = comp %>% slice_head(n=15), aes(label = gene), show.legend = F, box.padding = 0.9, max.overlaps = Inf) +
+    # {if(c != "DN_vs_Kit" )theme(legend.position = "none")} +
+    theme(legend.position = "none") +
+     labs(colour = "P.val") +
+    scale_x_continuous(limits = c(0,15)) +
+    # scale_x_continuous(limits = c(limits$xmin, limits$xmax)) +
+    # scale_y_continuous(limits = c(limits$ymin, limits$ymax)) +
+    ggtitle(c) -> p
+  ps[[c]] = p
+  
+  # ggsave(p, filename = paste0("../plots/volcanos_",c,".pdf"), width = 10, height = 10, units = "cm")
+}
+
+
+```
+
+## Write DEGs
+```{r}
+topTable(efit_ruv, coef = "Sell_pos_KO_vs_Wt", number = Inf) %>% as_tibble(rownames = "gene") %>%
+  write.csv(file = "../output/DEGs_Sell_pos_KO_vs_Wt_RUV.csv", quote = F, row.names = F)
+
+topTable(efit_ruv, coef = "DN_KO_vs_WT", number = Inf) %>% as_tibble(rownames = "gene") %>%
+  write.csv(file = "../output/DEGs_DN_KO_vs_WT_RUV.csv", quote = F, row.names = F)
+
+topTable(efit_ruv, coef = "WT_Sell_vs_DN", number = Inf) %>% as_tibble(rownames = "gene") %>%
+  write.csv(file = "../output/WT_Sell_vs_DN_RUV.csv", quote = F, row.names = F)
+
+```
+
+
+## Heatmap
+
+```{r}
+exp = cpm(dge, log = T)
+
+vars = matrixStats::rowVars(exp)
+names(vars) = row.names(exp)
+
+vars = sort(vars)
+top500 = tail(vars, n = 500)
+
+top10 = row.names(topTable(efit, number = 10))
+
+pheatmap::pheatmap(exp[top10,], scale = "row", annotation_col = dge$samples)
+
+pheatmap::pheatmap(exp[names(top500),], scale = "row", annotation_col = dge$samples)
+```
+
+```{r}
+pheatmap::pheatmap(exp[c("Pou2af1", "Cd79b","Cd19", "H2-Aa", "H2-Ab1",  "Jchain", "Xbp1",  "Pax5"),], scale = "none",
+                   annotation_col = dge$samples[,c("group", "sort", "genotype")], display_numbers = T)
+```
+## Contamination plays
+```{r}
+counts = data.frame("Bcell1" = c(1,5,1,5), "Bcell2" = c(1,6,1,5), "Tcell1" = c(10,11,20,21), "Tcell2" = c(15,14,9,10))
+row.names(counts)
+d = DGEList(t(counts))
+d$samples$group = c("M","M","C","C")
+
+G = d$samples$group
+C = c(1,1.0716750	,1,1.0580081	)
+
+cpm(d, log = T) %>% as_tibble(rownames = "g") %>%
+  pivot_longer(-g) %>%
+  mutate(c = ifelse(name %in% c("S 2", "S 4"), "b", "t")) %>%
+  filter(grepl("Bcell", g)) %>%
+  group_by(c) %>% mutate(bg = mean(value)) %>%
+  ungroup() %>%
+  mutate(bg = bg[1]) %>%
+  group_by(name) %>% summarise(coef = mean(value/bg))
+
+design = model.matrix(~G+C)
+v = voom(d, design)
+
+fit = lmFit(v, design)
+fit = contrasts.fit(fit, coefficients = 3)
+topTable(eBayes(fit)) 
+
+plotMDS(removeBatchEffect(cpm(d, log=T), batch = C, design = model.matrix(~G)))
+```
+## Filter Genes?
+```{r}
+exp%>% as_tibble(rownames = "g") %>%
+  pivot_longer(-g) %>% 
+  ggplot(aes(value, ..density..)) +
+  geom_density(aes(color = name))+ theme_classic()
+```
+
+```{r}
+exp%>% as_tibble(rownames = "g") %>%
+  pivot_longer(-g) %>% 
+  group_by(g) %>% summarise(value = max(value)) %>%
+  ggplot(aes(value, ..density..)) +
+  geom_density()+ theme_classic() +
+  geom_vline(xintercept = 2)
+```
+```{r}
+exp%>% as_tibble(rownames = "g") %>%
+  pivot_longer(-g) %>% 
+  group_by(g) %>% summarise(value = max(value)) %>%
+  filter(value > 2) -> filt
+```
+## Hallmark
+
+```{r}
+mh = read.table("~/projects/references/mouse/mh.all.v2022.1.Mm.symbols.gmt", sep = "%")
+
+data = list()
+
+con = file("~/projects/references/mouse/mh.all.v2022.1.Mm.symbols.gmt", "r")
+  while ( TRUE ) {
+    line = readLines(con, n = 1)
+    if ( length(line) == 0 ) {
+      break
+    }
+    split = strsplit2(line, split = "\t")
+    print(split)
+    data[[split[1]]] = split[-c(1:2)]
+  }
+
+  close(con)
+  
+print("blank")
+```
+
+```{r}
+dge = estimateDisp(dge, design = design3, robust = T)
+roasts_Sell_pos_KO_vs_Wt = lapply(data, function(x) roast(dge, design = design3, index = x, contrast = c(1,-1,0,0,0,0,0)))
+
+rbind(roasts_Sell_pos_KO_vs_Wt[[2]]$p.value[,2], roasts_Sell_pos_KO_vs_Wt[[1]]$p.value[,2])
+
+p_vals = lapply(roasts_Sell_pos_KO_vs_Wt, function(x) x$p.value[,2])
+p_vals_df = purrr::reduce(p_vals, rbind)
+
+row.names(p_vals_df) = names(p_vals)
+colnames(p_vals_df) = c("Down", "Up", "UpOrDown", "Mixed")
+
+p_vals_df %>% as_tibble(rownames = "pathway") %>% arrange(Down)
+```
+```{r}
+roasts_DN_pos_KO_vs_Wt = lapply(data, function(x) roast(dge, design = design3, index = x, contrast = c(0,0,1,-1,0,0,0)))
+
+
+p_vals_dn = lapply(roasts_DN_pos_KO_vs_Wt, function(x) x$p.value[,2])
+p_vals_df_dn = purrr::reduce(p_vals_dn, rbind)
+
+row.names(p_vals_df_dn) = names(p_vals_dn)
+colnames(p_vals_df_dn) = c("Down", "Up", "UpOrDown", "Mixed")
+
+p_vals_df_dn %>% as_tibble(rownames = "pathway") %>% arrange(Down)
+```
+```{r}
+write.csv(p_vals_df_dn, file = "../output/hallmark_DN_KO_vs_Wt.csv", quote = F, row.names = T)
+write.csv(p_vals_df, file = "../output/hallmark_Sell_KO_vs_Wt.csv", quote = F, row.names = T)
+```
+
+## Venn Diagram
+
+```{r}
+pdf("../plots/venn_KO_vs_WT.pdf", width = 9)
+vennDiagram(decideTests(efit_ruv, lfc = 1)[,1:2], include = c("up", "down"), counts.col = c("red", "blue"))
+dev.off()
+
+decideTests(efit_ruv, lfc = 1)[,1:2] -> d
+d %>% as.data.frame() %>% as_tibble(rownames = "gene") %>%
+  filter(Sell_pos_KO_vs_Wt == 1 & DN_KO_vs_WT == 1 | Sell_pos_KO_vs_Wt == -1 & DN_KO_vs_WT == -1)
+```
+

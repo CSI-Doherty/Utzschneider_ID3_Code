@@ -1,0 +1,514 @@
+---
+title: "01.5_RNA-bulk_Feb23"
+author: "jibsch"
+date: "2023-02-10"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r}
+library(edgeR)
+library(tidyverse)
+library(egg)
+library(ggrepel)
+
+
+
+colours = RColorBrewer::brewer.pal(11, "Spectral")[c(1,4,10)]
+names(colours) = c("CD62L_positive", "Double_negative", "Kit_positive")
+```
+
+```{r}
+data = read.table("../data/table_bulkRNA_amania_Feb23_mm39", header=T, sep = "\t")
+row.names(data) = data$Geneid
+
+names(data) = gsub("...align.bulk_amania_Feb23..","", names(data)) %>% gsub("_S[1-8]_L001.PE.starAligned.sortedByCoord.out.bam","",.)
+
+dge = DGEList(data[,-c(1:6)])
+dge$samples$group = factor(gsub("_[12]","",rownames(dge$samples)))
+dge$samples$group = recode(dge$samples$group,
+                           "CD62L_negve" = "CD62L_positive",
+                           "ckit_negve_CD62L_negve" = "Double_negative",
+                           "ckit_posve" = "Kit_positive"
+                           )
+# DN == double negative
+
+dge$samples$batch = factor(ifelse(grepl("_1$", row.names(dge$samples)), "batch1", "batch2"))
+
+dge$samples$batch2 = factor(ifelse(dge$samples$group == "Kit_positive", "batch2", as.character(dge$samples$batch)))
+
+row.names(dge$samples) = paste(dge$samples$group, gsub("batch", "",dge$samples$batch), sep = "_")
+colnames(dge) = paste(dge$samples$group, gsub("batch", "",dge$samples$batch), sep = "_")
+
+dge = dge[filterByExpr(dge),]
+dge = calcNormFactors(dge)
+
+plotMDS(dge, col = as.numeric(dge$samples$group)) 
+plotMDS(dge, col = as.numeric(dge$samples$batch))
+```
+```{r}
+write.csv(dge$counts, quote = F, file = "../output/counts_table_bulk_Feb23.csv")
+```
+
+
+## Batch effect
+```{r}
+G = dge$samples$group
+B = dge$samples$batch
+design = model.matrix(~0+G+B)
+v = voom(dge, design, plot = T)
+
+fit = lmFit(v, design)
+fit = contrasts.fit(fit, contrasts = c(0,0,0,1))
+efit = eBayes(fit)
+summary(decideTests(efit))
+
+topTable(efit)
+```
+### Estimate B cell contamination
+```{r}
+select = topTable(efit, n = Inf) %>% as_tibble(rownames = "gene") %>%
+  filter(logFC < 0) %>% slice_head(n = 200)
+
+cpm(dge, log = T) %>% as_tibble(rownames = "gene") %>%
+  filter(gene %in% select$gene) %>%
+  pivot_longer(-gene) %>%
+  left_join(dge$samples %>% as_tibble(rownames = "name")) %>%
+    group_by(batch, gene) %>% mutate(baseline = mean(value)) %>% 
+  group_by(gene) %>% mutate(bl = ifelse(batch[1] == "batch2", baseline[1], baseline[2])) %>% 
+  ungroup() %>%
+  mutate(ratio = value/bl) -> dat
+
+dat %>% group_by(name) %>% summarise(r = mean(ratio))
+  
+dat %>%filter(batch == "batch1", ratio < 50) %>%
+  ggplot(aes(name, ratio)) +
+  geom_violin(draw_quantiles = 0.5) +
+  scale_y_continuous(limits = c(0,10)) 
+  # geom_hline(data = data.frame(name = c("CD62L_positive_1", "Double_negative_1", "Kit_positive_1"),
+  #                              value = c(1.5, 1.5,1.25)), aes(yintercept = value))
+```
+```{r}
+dge$samples$b_cell_cont = c(1,2.5500599,2.5641135	, 1, 1, 1.6962490)
+
+normcpm = removeBatchEffect(cpm(dge, log = T), batch = dge$samples$b_cell_cont, design = model.matrix(~0+G))
+
+plotMDS(normcpm, col = as.numeric(dge$samples$group))
+```
+```{r}
+mds = plotMDS(normcpm, plot = F)
+
+data.frame(x = mds$x, y = mds$y, group = dge$samples$group) -> pdat
+  
+ggplot(pdat, aes(x,y)) +
+  geom_point(aes(fill = group), shape = 21, size = 2) +
+  geom_text_repel(data = pdat %>% group_by(group) %>% summarise(x = mean(x), y=mean(y)), aes(label = group)) +
+  theme_classic() +
+  scale_fill_manual(values = colours) +
+  theme(legend.position = "None") +
+  labs(x = paste(mds$axislabel, "(57%)"), y = paste(mds$axislabel, "(43%)")) -> p
+
+ggsave(p, filename = "../plots/MDS.pdf", width = 8, height = 7, units = "cm")
+```
+
+
+
+```{r}
+normcpm = removeBatchEffect(cpm(dge, log = T), batch = dge$samples$batch2, batch2 = dge$samples$batch, design = model.matrix(~0+G))
+
+plotMDS(normcpm, col = as.numeric(dge$samples$group))
+```
+
+```{r}
+library(ruv)
+
+summary(rowSums(cpm(dge, log=T) > 3) == length(dge$samples$group))
+
+filt = rowSums(cpm(dge, log=T) > 3) == length(dge$samples$group)
+
+matrixStats::rowVars(x = cpm(dge,log = T),rows = filt) -> vars
+names(vars) = names(filt[filt])
+
+stable = sort(vars)[1:2000]
+```
+```{r}
+newY = RUVIII(Y = t(log2(dge$counts + 1)), M = model.matrix(~0+dge$samples$group), ctl = row.names(dge) %in% names(stable), k = 3)
+
+#write.csv(t(newY), file = "../output/ruv_adjusted_counts.csv")
+
+pca = prcomp(newY)
+
+
+pca$x %>% as_tibble() %>%
+    cbind(dge$samples) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes_string(color = "group")) +
+    geom_text_repel(aes(label = group)) +
+    ggpubr::theme_classic2()
+
+
+plotMDS(t(newY), col = as.numeric(dge$samples$group))
+```
+```{r}
+out = RUV4(Y = t(log2(dge$counts + 1)), X = dge$samples$group,  ctl = row.names(dge) %in% names(stable), k = 2)
+
+out$W %>% as.data.frame() %>% mutate(donor = dge$samples$batch) %>%
+  ggplot(aes(V1, V2, colour = donor)) + geom_point() + theme_classic()
+```
+
+## DGE Comparison
+
+```{r}
+G = dge$samples$group
+B = dge$samples$batch
+B2 = dge$samples$batch2
+B3 = dge$samples$b_cell_cont
+
+design = model.matrix(~0+G+B3)
+v = voom(dge, design, plot = T)
+
+fit = lmFit(v, design)
+fit = contrasts.fit(fit, contrasts = makeContrasts("Sell_vs_Kit" = "GCD62L_positive - GKit_positive",
+                                                   "DN_vs_Kit" = "GDouble_negative - GKit_positive",
+                                                   "Sell_vs_DN" = "GCD62L_positive - GDouble_negative",
+                                                   levels = design))
+efit = eBayes(fit)
+summary(decideTests(efit))
+
+topTable(efit)
+
+x = topTable(efit, number = Inf)
+```
+
+```{r}
+library(openxlsx)
+wb = createWorkbook()
+for(c in c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")) {
+  addWorksheet(wb, c)
+  writeData(wb, sheet = c, x = as.data.frame(topTable(efit, coef = c, number = Inf)), rowNames = T)
+}
+saveWorkbook(wb, "../output/DEGs_bulk_Sell_Kit.xlsx", overwrite = T)
+```
+
+
+```{r}
+d = decideTests(efit)
+
+vennDiagram(d, include = c("up", "down"), counts.col = c("red", "blue"))
+vennDiagram(d)
+```
+
+#KEGG
+
+```{r}
+library(org.Mm.eg.db)
+efit$entrez = mapIds(org.Mm.eg.db, rownames(efit), "SYMBOL", column = "ENTREZID")
+
+keggs = lapply(list("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit"), function(x)
+  kegga(efit, geneid = efit$entrez, species = "Mm", coef = x))
+names(keggs) = c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")
+
+# kegg[grepl("stem cell", kegg$Pathway),]
+# topKEGG(keggs$Kit_vs_Sell)
+```
+
+```{r}
+library(openxlsx)
+wb = createWorkbook()
+for(c in c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")) {
+  addWorksheet(wb, c)
+  writeData(wb, sheet = c, x = as.data.frame(topKEGG(keggs[[c]], number = 50)), rowNames = T)
+}
+saveWorkbook(wb, "../output/KEGG_bulk_Sell_Kit.xlsx", overwrite = T)
+```
+
+
+##GO
+
+```{r}
+library(org.Mm.eg.db)
+efit$entrez = mapIds(org.Mm.eg.db, rownames(efit), "SYMBOL", column = "ENTREZID")
+
+gos = lapply(list("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit"), function(x)
+  goana(efit, geneid = efit$entrez, species = "Mm", coef = x))
+names(gos) = c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")
+
+
+topGO(gos$Sell_vs_Kit)
+```
+
+```{r}
+library(openxlsx)
+wb = createWorkbook()
+for(c in c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")) {
+  addWorksheet(wb, c)
+  writeData(wb, sheet = c, x = as.data.frame(topGO(gos[[c]], number = 50)), rowNames = T)
+}
+saveWorkbook(wb, "../output/GO_bulk_Sell_Kit.xlsx", overwrite = T)
+```
+
+```{r}
+pheatmap::pheatmap(normcpm[rownames(topTable(efit, number = 20, coef = "Sell_vs_Kit")),], scale = "row", fontsize_row = 7)
+```
+
+```{r}
+pheatmap::pheatmap(normcpm[rownames(topTable(efit, number = 100, coef = "Sell_vs_Kit", sort.by = "p")),], scale = "row",
+                   filename = "../plots/heatmap2_top100.pdf", width = 4, height = 12, fontsize_row = 7)
+```
+
+
+## Volcano
+```{r}
+cols = list("Sell_vs_Kit" = unname(c(colours["Kit_positive"], "grey", colours["CD62L_positive"])),
+            "Sell_vs_DN" = unnameme(c(colours["Double_negative"], "grey", colours["CD62L_positive"])),
+            "DN_vs_Kit" = unname(c(colours["Kit_positive"], "grey", colours["Double_negative"])))
+
+ps = list()
+genes = c("Sell", "Dapl1", "Il7r", "Ccl5", "Ccr7", "Il6ra", "S1pr1", "Nr4a2", "Tox2", 
+           "Il2ra", "Kit", "Xcl1", "Id3", "Tcf7", "Bach")
+dotsize_outer = 1
+dotsize_inner = 0.5
+
+limits = topTable(efit, number = Inf) %>% dplyr::select(-F, -adj.P.Val, -AveExpr)  %>%
+  pivot_longer(cols = 1:3) %>%
+  summarise(xmin = min(value), xmax = max(value),ymin = 0, ymax=max(-log10(P.Value)))
+
+for(c in c("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit")) {
+  comp = topTable(efit, coef = c, number = Inf) %>%
+    as_tibble(rownames = "gene") %>% mutate(sig = adj.P.Val <= 0.05 & abs(logFC)>=1, up = logFC >0) %>%
+    mutate(g = ifelse(sig, ifelse(up, "Up", "Down"), "Not Sig"))
+
+  ggplot(comp, aes(logFC, -log10(P.Value))) +
+    geom_point(aes(colour = g), size = dotsize_inner) +
+    geom_point(data = comp %>% filter(gene %in% genes), colour = "green", size = dotsize_outer) +
+    geom_point(data = comp %>% filter(gene %in% genes), aes(colour = g), size = dotsize_inner) +
+    theme_classic() +
+    scale_colour_manual(values = cols[[c]]) +
+    geom_text_repel(data = comp %>% filter(gene %in% genes), aes(label = gene), show.legend = F, box.padding = 0.9, max.overlaps = Inf) +
+    # {if(c != "DN_vs_Kit" )theme(legend.position = "none")} +
+    theme(legend.position = "none") +
+    labs(colour = "P.val") +
+    scale_x_continuous(limits = c(limits$xmin, limits$xmax)) +
+    scale_y_continuous(limits = c(limits$ymin, limits$ymax)) +
+    ggtitle(c) -> p
+  ps[[c]] = p
+  
+  ggsave(p, filename = paste0("../plots/volcanos_",c,".pdf"), width = 10, height = 10, units = "cm")
+}
+
+
+```
+```{r}
+genes = c("Sell", "Dapl1", "Il7r", "Ccl5", "Ccr7", "Il6ra", "S1pr1", "Nr4a2", "Tox2", 
+           "Il2ra", "Kit", "Xcl1", "Id3", "Tcf7", "Bach")
+
+comp = lapply(list("Sell_vs_Kit", "Sell_vs_DN", "DN_vs_Kit"), 
+              function(c){
+                topTable(efit, coef = c, number = Inf) %>% 
+                  as_tibble(rownames = "gene") %>% mutate(sig = adj.P.Val <= 0.05 & abs(logFC)>=1, up = logFC >0) %>%
+                  mutate(g = ifelse(sig, ifelse(up, "Up", "Down"), "Not Sig")) %>%
+                  mutate(comp = c)
+              })
+
+comp = purrr::reduce(comp, rbind)
+
+
+  
+ggplot(comp, aes(logFC, -log10(P.Value))) + 
+    geom_point(aes(colour = g)) +
+    geom_point(data = comp %>% filter(gene %in% genes), colour = "black", size = 3) +
+    geom_point(data = comp %>% filter(gene %in% genes), aes(colour = g)) +
+    theme_classic() + 
+    scale_colour_manual(values = c("blue", "grey", "red")) +
+    geom_text_repel(data = comp %>% filter(gene %in% genes), aes(label = gene), show.legend = F, box.padding = 0.9, max.overlaps = Inf) +
+    facet_wrap(~comp) +
+    labs(colour = "P.val") +
+    theme(strip.background = element_rect(colour = "white")) -> p
+
+
+
+
+ggsave(p, filename = "../plots/volcanos.pdf", width = 30, height = 10, units = "cm")
+```
+
+```{r}
+library(openxlsx)
+id3_volcano = readWorkbook("../data/DU-RNA_seq-ID3KO-16May2022-sample-level-gene-expression-list.xlsx", sheet = 1)
+```
+
+
+##Hallmark genes
+
+```{r}
+mh = read.table("~/projects/references/mouse/mh.all.v2022.1.Mm.symbols.gmt", sep = "%")
+
+data = list()
+
+con = file("~/projects/references/mouse/mh.all.v2022.1.Mm.symbols.gmt", "r")
+  while ( TRUE ) {
+    line = readLines(con, n = 1)
+    if ( length(line) == 0 ) {
+      break
+    }
+    split = strsplit2(line, split = "\t")
+    print(split)
+    data[[split[1]]] = split[-c(1:2)]
+  }
+
+  close(con)
+  
+
+```
+
+```{r}
+dge = estimateDisp(dge, design = design, robust = T)
+roasts_kit_sell = lapply(data, function(x) roast(dge, design = design, index = x, contrast = c(1,0,-1,0)))
+
+rbind(roasts_kit_sell[[2]]$p.value[,2], roasts_kit_sell[[1]]$p.value[,2])
+
+p_vals = lapply(roasts_kit_sell, function(x) x$p.value[,2])
+p_vals_df = purrr::reduce(p_vals, rbind)
+
+row.names(p_vals_df) = names(p_vals)
+colnames(p_vals_df) = c("Down", "Up", "UpOrDown", "Mixed")
+
+p_vals_df %>% as_tibble(rownames = "pathway") %>% arrange(Down)
+```
+
+```{r}
+roasts_kit_dn = lapply(data, function(x) roast(dge, design = design, index = x, contrast = c(0,1,-1,0)))
+
+p_vals = lapply(roasts_kit_dn, function(x) x$p.value[,2])
+p_vals_df = purrr::reduce(p_vals, rbind)
+
+row.names(p_vals_df) = names(p_vals)
+colnames(p_vals_df) = c("Down", "Up", "UpOrDown", "Mixed")
+
+p_vals_df %>% as_tibble(rownames = "pathway") %>% arrange(Down)
+
+write.csv(p_vals_df, quote = F, row.names = T, file = "~/projects/Utzschneider_Lab/RNA/output/hallmark_dn_vs_kit.csv")
+```
+
+
+## ID3 Signature
+```{r}
+library(openxlsx)
+
+tpex = readWorkbook("../data/Table 3 & 4.xlsx", sheet = 1)
+tpex = tpex[tpex$Symbol %in% row.names(efit),]
+
+topTable(efit, coef = "Sell_vs_Kit", number = Inf) %>% as_tibble(rownames = "gene") -> tt
+
+lfcs = tt$logFC
+names(lfcs) = tt$gene
+
+
+
+barcodeplot(statistics = lfcs, index = tpex$Symbol[tpex$logFC > 0], index2 = tpex$Symbol[tpex$logFC < 0])
+
+summary(tt$logFC[tt$adj.P.Val<0.05 & tt$logFC>0])
+summary(tt$logFC[tt$adj.P.Val<0.05 & tt$logFC<0])
+
+barcodeplot(statistics = lfcs, index = tpex$Symbol, gene.weights = tpex$logFC, weights.label = "het vs KO", 
+            labels = c("Up in Kit+", "Up in Sell+"), xlab = "log FC Sell - Kit", quantiles = c(-0.27,0.27))
+```
+```{r}
+dge = estimateDisp(dge, design, robust = T)
+roast(dge, design, contrast = c(1,0,-1,0), index = tpex$Symbol[tpex$logFC > 0])
+roast(dge, design, contrast = c(1,0,-1,0), index = tpex$Symbol[tpex$logFC < 0])
+```
+
+
+## RTN
+```{r}
+library(RTN)
+
+TFs = read.table("~/projects/references/human/Transcription_Factors.txt")
+
+TFs$mouse = paste0(substr(TFs$V1,1,1), tolower(substr(TFs$V1,2,99)))
+
+TFs = TFs$mouse[TFs$mouse %in% row.names(dge)]
+
+rtni <- tni.constructor(expData = cpm(dge, log=T), 
+                        regulatoryElements = TFs, 
+                        rowAnnotation = NULL, 
+                        colAnnotation = dge$samples)
+
+rtni <- tni.permutation(rtni, nPermutations = 100)
+
+rtni <- tni.bootstrap(rtni)
+
+rtni <- tni.dpi.filter(rtni)
+
+tni.regulon.summary(rtni)
+```
+```{r}
+dge2 = dge[!row.names(dge) %in% row.names(topTable(efit, n = 391)),]
+
+dge2 = calcNormFactors(dge2)
+
+plotMDS(dge2, col = as.numeric(dge2$samples$group))
+```
+```{r}
+library(ruv)
+
+summary(rowSums(cpm(dge, log=T) > 3) == length(dge$samples$group))
+
+filt = rowSums(cpm(dge, log=T) > 3) == length(dge$samples$group)
+
+matrixStats::rowVars(x = cpm(dge,log = T),rows = filt) -> vars
+names(vars) = names(filt[filt])
+
+stable = sort(vars)[1:2000]
+
+newY = RUVIII(Y = t(log2(dge$counts + 1)), M = model.matrix(~0+dge$samples$group), ctl = row.names(dge) %in% names(stable), k = 3)
+plotMDS(t(newY), col = as.numeric(dge$samples$group))
+```
+
+```{r}
+out = RUV4(Y = t(log2(dge$counts + 1)), X = dge$samples$group,  ctl = row.names(dge) %in% names(stable), k = 3)
+```
+
+
+## Kit vs Sell Signature on SC
+
+```{r}
+seu_batch1_batch2_arm21_c13_d8_filt2 <- readRDS("~/projects/Utzschneider_Lab/RNA/output/seu_batch1_batch2_arm21_c13_d8_filt2.Rds")
+library(Seurat)
+DimPlot(seu_batch1_batch2_arm21_c13_d8_filt2, reduction = "umap_rpca")
+source("~/tools/BioinfTools/Utility_Functions.R")
+source("~/tools/BioinfTools/Plotting_Functions.R")
+```
+
+```{r}
+up = row.names(topTable(efit, coef = 1, number = Inf) %>% filter(logFC > 0) %>% slice_head(n=100))
+dn = row.names(topTable(efit, coef = 1, number = Inf) %>% filter(logFC < 0) %>% slice_head(n=100))
+seu_batch1_batch2_arm21_c13_d8_filt2 = AddSignature(seu_batch1_batch2_arm21_c13_d8_filt2,
+                                                    up, name = "sell_vs_kit_up")
+seu_batch1_batch2_arm21_c13_d8_filt2 = AddSignature(seu_batch1_batch2_arm21_c13_d8_filt2,
+                                                    dn, name = "sell_vs_kit_dn")
+ggarrange(plots = list(plotto_signature_scoring_plot("sell_vs_kit_up", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca"),
+                       plotto_signature_scoring_plot("sell_vs_kit_dn", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca")))
+
+seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit = scale(seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit_up) - 
+  scale(seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit_dn)
+
+plotto_signature_scoring_plot("sell_vs_kit", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca")
+```
+
+```{r}
+up = row.names(decideTests(efit))[decideTests(efit)[,1] > 0]
+dn = row.names(decideTests(efit))[decideTests(efit)[,1] < 0]
+seu_batch1_batch2_arm21_c13_d8_filt2 = AddSignature(seu_batch1_batch2_arm21_c13_d8_filt2,
+                                                    up, name = "sell_vs_kit_up")
+seu_batch1_batch2_arm21_c13_d8_filt2 = AddSignature(seu_batch1_batch2_arm21_c13_d8_filt2,
+                                                    dn, name = "sell_vs_kit_dn")
+ggarrange(plots = list(plotto_signature_scoring_plot("sell_vs_kit_up", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca"),
+                       plotto_signature_scoring_plot("sell_vs_kit_dn", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca")))
+
+seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit = scale(seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit_up) - 
+  scale(seu_batch1_batch2_arm21_c13_d8_filt2$sell_vs_kit_dn)
+
+plotto_signature_scoring_plot("sell_vs_kit", seu_batch1_batch2_arm21_c13_d8_filt2, size = 0.8, reduction = "umap_rpca")
+```
